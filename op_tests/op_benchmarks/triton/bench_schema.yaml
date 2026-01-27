@@ -71,3 +71,15 @@ benchmarks:
   deepgemm_attention:
     input_columns: [batch_size, next_n, heads, index_dim, avg_kv_length]
     output_columns: [non_ragged_k]
+  fused-attention-fwd-d128-layoutbhsd-causal0-typebf16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal1-typebf16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal0-typefp16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal1-typefp16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
