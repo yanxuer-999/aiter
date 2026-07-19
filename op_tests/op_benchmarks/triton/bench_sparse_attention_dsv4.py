@@ -19,6 +19,8 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 )
 
 import argparse
+import csv
+from pathlib import Path
 
 import torch
 import triton
@@ -202,6 +204,10 @@ def _time_backend(backend, q, kv, indices, indptr, num_queries, num_heads, scale
 def run_prefill_bench(args, device: str):
     print("\n========== PREFILL ==========")
     rows = []
+    # Records for the pipeline CSV (`-o`): one row per shape, with the tracked
+    # kernel throughput. The Gluon backend (mla_gluon) is the production target,
+    # so it is the primary metric; Triton is kept alongside for context.
+    csv_records = []
     for cfg in args.prefill_cfgs:
         num_queries, num_heads, num_kv, topk = cfg
         torch.manual_seed(0)
@@ -249,9 +255,28 @@ def run_prefill_bench(args, device: str):
                     f"{speedup:.2f}x",
                 )
             )
+            csv_records.append(
+                {
+                    "Q": num_queries,
+                    "H": num_heads,
+                    "Kv": num_kv,
+                    "topk": topk,
+                    "gluon_TFLOPS": round(glu_tflops, 4),
+                    "triton_TFLOPS": round(tri_tflops, 4),
+                }
+            )
         else:
             rows.append(
                 (num_queries, num_heads, num_kv, topk, tri_ms, tri_tflops, tri_gbps)
+            )
+            csv_records.append(
+                {
+                    "Q": num_queries,
+                    "H": num_heads,
+                    "Kv": num_kv,
+                    "topk": topk,
+                    "triton_TFLOPS": round(tri_tflops, 4),
+                }
             )
 
     if HAS_GLUON:
@@ -269,6 +294,33 @@ def run_prefill_bench(args, device: str):
     else:
         headers = ["Q", "H", "Kv", "topk", "triton ms", "triton TFLOPS", "triton GB/s"]
     _print_table("PREFILL", headers, rows)
+
+    if args.o:
+        _write_csv(csv_records)
+
+
+def _write_csv(records):
+    """Write results to `bench_<name>.csv` for the perf pipeline.
+
+    The filename matches the ingest convention `bench_<schema-key>.csv`
+    (see bench_schema.yaml key `sparse_attention_dsv4`).
+    """
+    if not records:
+        print("No CSV records to write (no completed configs).")
+        return
+    out_path = Path(f"{Path(__file__).stem}.csv")
+    # Union of keys preserves the input columns first, then the metric columns.
+    fieldnames = []
+    for rec in records:
+        for k in rec:
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(rec)
+    print(f"Wrote {len(records)} rows to {out_path}")
 
 
 def _print_table(title, headers, rows):
@@ -356,6 +408,11 @@ def _parse_args():
             "8192,128,8192,512",
             "8192,128,8192,1024",
         ],
+    )
+    p.add_argument(
+        "-o",
+        action="store_true",
+        help="Write performance results to CSV file (for the perf pipeline)",
     )
     args = p.parse_args()
     args.prefill_cfgs = [tuple(int(x) for x in s.split(",")) for s in args.prefill_cfgs]
