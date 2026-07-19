@@ -65,3 +65,9 @@ benchmarks:
   rmsnorm:
     input_columns: [model_name, M, N]
     output_columns: [Bandwidth_(GB/s)]
+  sparse_attention_dsv4:
+    input_columns: [Q, H, Kv, topk]
+    output_columns: [gluon_TFLOPS, triton_TFLOPS]
+  deepgemm_attention:
+    input_columns: [batch_size, next_n, heads, index_dim, avg_kv_length]
+    output_columns: [non_ragged_k]
