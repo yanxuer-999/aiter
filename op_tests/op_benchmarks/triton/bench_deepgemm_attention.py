@@ -18,6 +18,9 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+)
 
 
 def cdiv(x: int, y: int) -> int:
@@ -183,7 +186,10 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
             line_names=line_names,
             styles=[("red", "-"), ("green", "-")],
             ylabel="TFLOPS",
-            plot_name="paged_mqa_logits",
+            # `bench_<name>` so the emitted CSV (`bench_deepgemm_attention.csv`)
+            # matches the perf pipeline ingest convention (bench_schema.yaml key
+            # `deepgemm_attention`).
+            plot_name=get_caller_name_no_ext(),
             args={},
         )
     )
@@ -439,7 +445,9 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         )
         return flops
 
-    test_deepgemm_fp8_paged_mqa_logits.run(print_data=False)
+    test_deepgemm_fp8_paged_mqa_logits.run(
+        save_path="." if args.o else None, print_data=False
+    )
     print_json_table("paged_mqa_logits summary", rows)
 
 
@@ -514,6 +522,11 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="RNG seed for input data and generated index tables (default: 0)",
+    )
+    parser.add_argument(
+        "-o",
+        action="store_true",
+        help="Write performance results to CSV file (for the perf pipeline)",
     )
 
     args = parser.parse_args()
