@@ -76,6 +76,20 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 # (batch*qlen >= 256); "1" forces it on for any supported MTP shape; "0" forces off.
 _MPACK_MODE = os.environ.get("AITER_MLA_GLUON_MPACK", "auto").lower()
 
+# AITER_MLA_GLUON_MPACK128 (experimental): "1" forces the true 8-warp M=128 packing
+# path (bh16mpack128) for supported MTP shapes (bf16 KV, nhead<=16, qlen 2..17). It
+# packs 8 q_pos per qblock (warps_per_cta=[8,1], each warp keeps a [16,512] acc) so
+# KV is re-read cdiv(qlen,8)x instead of cdiv(qlen,4)x (M=64 mpack). "0"/unset: off.
+_MPACK128_MODE = os.environ.get("AITER_MLA_GLUON_MPACK128", "0").lower()
+
+# AITER_MLA_GLUON_XCD_REMAP (experimental): "1" launches the bh16* path as a 1-D
+# grid with an XCD swizzle that co-locates all qblocks of a given (batch, split)
+# on the same XCD, so the 2nd..Nth qblock's KV re-reads can hit that XCD's L2
+# instead of HBM. Only affects M-pack regimes (qlen>QPOS_PER_BLOCK). "auto"
+# (default): engage only in the multi-wave region (grid_mn>256) where L2
+# co-location pays off; "1": force on for any eligible M-pack shape; "0": off.
+_XCD_REMAP_MODE = os.environ.get("AITER_MLA_GLUON_XCD_REMAP", "auto").lower()
+
 # fmt: off
 @gluon.jit
 def _mla_decode_gluon(
@@ -125,6 +139,9 @@ def _mla_decode_gluon(
     REGIME: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,  # MTP: True when QLEN>1 (per-q_pos causal tail mask)
+    XCD_REMAP: gl.constexpr = False,  # bh16* only: 1-D grid + XCD swizzle for KV L2 reuse
+    SPLIT_QLEN: gl.constexpr = 1,  # number of qblocks on grid axis 2 (XCD_REMAP decode)
+    GRID_MN: gl.constexpr = 1,  # total 1-D grid = BATCH * NUM_KV_SPLITS * SPLIT_QLEN
 ):
     # M-pack Phase-2 (true MFMA M-dim packing): the qlen query positions are packed
     # into the MFMA M dimension instead of an in-kernel unroll (Phase-1) or a grid
@@ -134,7 +151,7 @@ def _mla_decode_gluon(
     # BLOCK_H_PER_Q); KV is loaded once per (batch, split) WG and shared across all
     # packed rows. BLOCK_H_PER_Q=16 reserves 16 rows per q_pos (nhead<=16); rows with
     # q_pos>=QLEN or head>=NHEAD are masked off on Q load / O store.
-    M_PACK: gl.constexpr = (REGIME == 'bh16mpack')
+    M_PACK: gl.constexpr = (REGIME == 'bh16mpack' or REGIME == 'bh16mpack128')
     BLOCK_H_PER_Q: gl.constexpr = 16
     # M-pack q_pos blocking: each WG packs QPOS_PER_BLOCK = BLOCK_H//BLOCK_H_PER_Q
     # query positions into M (4 for BLOCK_H=64). For qlen > QPOS_PER_BLOCK the qlen
@@ -155,6 +172,33 @@ def _mla_decode_gluon(
         cur_head_id = gl.program_id(1) % NUM_M_BLOCKS
         q_pos = gl.program_id(1) // NUM_M_BLOCKS
         split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
+    elif XCD_REMAP:
+        # 1-D grid + XCD swizzle: co-locate all SPLIT_QLEN qblocks of a given
+        # (batch, split) on the same XCD so the 2nd..Nth qblock's KV re-reads hit
+        # that XCD's L2 instead of HBM. remap_xcd groups contiguous logical pids
+        # onto one XCD; we lay out logical pid so qblock is the fastest-varying
+        # axis, making the qblocks of one (batch, split) a contiguous run.
+        # Inlined remap_xcd (non-chunked) to avoid a triton.jit call from gluon.jit.
+        pid = gl.program_id(0)
+        pids_per_xcd: gl.constexpr = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds: gl.constexpr = GRID_MN % NUM_XCDS
+        tall_xcds_eff: gl.constexpr = NUM_XCDS if tall_xcds == 0 else tall_xcds
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        if xcd < tall_xcds_eff:
+            logical = xcd * pids_per_xcd + local_pid
+        else:
+            logical = (
+                tall_xcds_eff * pids_per_xcd
+                + (xcd - tall_xcds_eff) * (pids_per_xcd - 1)
+                + local_pid
+            )
+        # logical = (cur_batch * NUM_KV_SPLITS + split_kv_id) * SPLIT_QLEN + qblock
+        cur_head_id = 0
+        q_pos = logical % SPLIT_QLEN
+        tmp = logical // SPLIT_QLEN
+        split_kv_id = tmp % NUM_KV_SPLITS
+        cur_batch = tmp // NUM_KV_SPLITS
     else:
         cur_batch = gl.program_id(0)
         cur_head_id = 0
@@ -254,6 +298,42 @@ def _mla_decode_gluon(
             transposed=True,
             warps_per_cta=[4, 1],
         )
+    elif BLOCK_H == 128:
+        # bh16mpack128: true 8-warp M=128 packing (8 q_pos/qblock, 16 rows each).
+        # warps_per_cta=[8,1] keeps each warp's acc at [16,512] (baseline VGPRs, no
+        # spill). Q layouts = bh64's [64,*] extended by one more M bit (row bit 6 =
+        # 64) as a 3rd warp base; KV is loaded once and shared across all 128 rows.
+        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[1, 64],
+            warps_per_cta=[8, 1],
+            order=[1, 0],
+        )
+        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]],
+            cga_layout=[],
+            shape=[128, 512]
+        )
+        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (32, 0)),
+            lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
+            warp_bases=((1, 0), (2, 0), (64, 0)),
+            block_bases=[],
+            shape=[128, 64],
+        )
+        shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0], [64, 0]],
+            cga_layout=[],
+            shape=[128, 64]
+        )
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[8, 1],
+        )
     else:
         # BLOCK_H == 16: shared by bh16bn128 and bh16bn64. Q is [16, 512] / [16, 64]; warps tile K.
         blocked_q_nope: gl.constexpr = gl.BlockedLayout(
@@ -285,7 +365,52 @@ def _mla_decode_gluon(
 
     # KV-side layouts: switch by BLOCK_N.
     # bh16bn128 (BLOCK_N=128, fp8 KV) needs distinct K layouts; bh64 and bh16bn64 share BLOCK_N=64 bf16 KV.
-    if BLOCK_N == 128:
+    if REGIME == 'bh16mpack128':
+        # 8-warp (512-thread) BLOCK_N=64 bf16 KV layouts. Derived from the 4-warp
+        # BLOCK_N=64 layouts by moving one N register base into a 3rd warp base
+        # (8 warps hold half the per-thread registers of 4 warps). Shared layouts
+        # are thread-count-independent (LDS addressing) so they match the 4-warp ones.
+        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 16), (0, 32)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            warp_bases=((0, 1), (0, 2), (0, 4)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32]],
+            cga_layout=[],
+            shape=[512, 64]
+        )
+        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
+            warp_bases=((0, 1), (0, 2), (0, 32)),
+            block_bases=[],
+            shape=[64, 64],
+        )
+        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
+            cga_layout=[],
+            shape=[64, 64]
+        )
+        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0,),),
+            lane_bases=((8,), (16,), (32,), (0,), (0,), (0,)),
+            warp_bases=((1,), (2,), (4,)),
+            block_bases=[],
+            shape=[64],
+        )
+        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 16)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            warp_bases=((0, 1), (0, 2), (0, 4)),
+            block_bases=[],
+            shape=[512, 32],
+        )
+    elif BLOCK_N == 128:
         # bh16bn128: K is [512, 128]fp8, KPE is [64, 128]fp8.
         blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32), (0, 64)),
@@ -373,7 +498,20 @@ def _mla_decode_gluon(
 
     # linear_v: each regime has unique warp/reg mapping (bh64 has degenerate warp_bases,
     # bh16bn128 has an extra K reg base for the 128-wide K, bh16bn64 has the bh16 warp layout at 64-wide K).
-    if REGIME == 'bh64' or REGIME == 'bh16mpack':
+    if REGIME == 'bh16mpack128':
+        # 8-warp M=128 V layout. NOTE: the "correct" mapping is V replicated across
+        # all 8 M-tiling warps (3 all-zero warp bases), but that trips an LLVM
+        # iota_range assertion during lowering. This non-degenerate variant tiles V's
+        # Dv dim across the 8 warps (3rd warp base (64,0)); the convert to the
+        # replicated mfma_layout_b then costs a cross-warp (LDS) round trip.
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((16, 0), (32, 0), (64, 0)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+    elif REGIME == 'bh64' or REGIME == 'bh16mpack':
         # bh16mpack reuses bh64's [4,1] warp distribution (warps tile M), so its
         # V layout matches bh64's degenerate (M-tiling) warp_bases.
         linear_v: gl.constexpr = gl.DistributedLinearLayout(
@@ -755,7 +893,10 @@ def _mla_decode_gluon(
     # M-pack: M-row -> (q_pos = row // BLOCK_H_PER_Q, head = row % BLOCK_H_PER_Q),
     # so the O/lse store address uses per-row q_pos and head, masked to valid
     # (q_pos < QLEN, head < NHEAD). Grid-axis: row -> head, q_pos from the grid.
-    blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
+    if BLOCK_H == 128:
+        blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[8], order=[0])
+    else:
+        blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
     row_o = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
     cur_head_o = cur_head_id * BLOCK_H + row_o
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
@@ -1001,11 +1142,22 @@ def mla_decode_gluon(
             )
         )
 
+    # Experimental true 8-warp M=128 packing (opt-in). When engaged it takes over
+    # the M-pack role (packs 8 q_pos/qblock) and disables the M=64 mpack path.
+    mpack128_supported = (
+        (1 <= nhead <= 16) and (kv_c.dtype == torch.bfloat16) and (2 <= qlen <= 17)
+    )
+    USE_MPACK128 = mpack128_supported and _MPACK128_MODE == "1"
+    if USE_MPACK128:
+        USE_MPACK = False
+
     # Pick regime by (nhead, kv dtype).
     if nhead in (64, 128):
         REGIME = "bh64"
     elif 1 <= nhead <= 16:
-        if USE_MPACK:
+        if USE_MPACK128:
+            REGIME = "bh16mpack128"
+        elif USE_MPACK:
             REGIME = "bh16mpack"
         elif kv_c.dtype == torch.bfloat16:
             REGIME = "bh16bn64"
@@ -1025,9 +1177,12 @@ def mla_decode_gluon(
     # Phase-2 packs q_pos into the MFMA M dimension (no in-kernel q_pos unroll).
     # Grid axis 2 carries: the full qlen (grid-axis path), or the qblock count
     # cdiv(qlen, QPOS_PER_BLOCK) in M-pack mode (4 positions per block).
-    MPACK_QPOS_PER_BLOCK = 4  # BLOCK_H(64) // BLOCK_H_PER_Q(16); keep in sync w/ kernel
+    # BLOCK_H // BLOCK_H_PER_Q(16); keep in sync w/ kernel. M=128 packs 8 q_pos/block.
+    MPACK_QPOS_PER_BLOCK = 8 if USE_MPACK128 else 4
     # grid axis 2 size: qblocks in M-pack mode, else one program per q_pos.
-    split_qlen = triton.cdiv(qlen, MPACK_QPOS_PER_BLOCK) if USE_MPACK else qlen
+    split_qlen = (
+        triton.cdiv(qlen, MPACK_QPOS_PER_BLOCK) if (USE_MPACK or USE_MPACK128) else qlen
+    )
 
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
@@ -1070,6 +1225,25 @@ def mla_decode_gluon(
         # Fill ~256 WGs (total WGs = batch * qblocks * NUM_KV_SPLITS), bounded by the
         # shortest seq's block count so every split holds >= 1 block. Each qblock is a
         # separate WG (grid axis 2), so the split budget divides by split_qlen (qblocks).
+        NUM_KV_SPLITS = max(
+            1,
+            min(256 // (batch_size * split_qlen), triton.cdiv(min_kv_seq_len, BLOCK_N)),
+        )
+        assert (
+            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        assert (
+            kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
+        ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
+    elif REGIME == "bh16mpack128":
+        # Experimental true 8-warp M=128 packing: BLOCK_H=128 packs QPOS_PER_BLOCK=8
+        # query positions into M (16 rows/q_pos; warps_per_cta=[8,1] so each warp keeps
+        # a [16,512] acc = baseline VGPRs, no spill). qlen>8 tiles over cdiv(qlen,8)
+        # qblocks (grid axis 2); KV re-read cdiv(qlen,8)x (1x for qlen<=8) vs cdiv(qlen,4)x
+        # for the M=64 mpack path. num_warps=8 is inferred from the [8,1] mfma layout.
+        BLOCK_H = 128
+        BLOCK_N = 64
+        NUM_XCDS = 1  # unused by 2-D split grid mapping
         NUM_KV_SPLITS = max(
             1,
             min(256 // (batch_size * split_qlen), triton.cdiv(min_kv_seq_len, BLOCK_N)),
@@ -1135,6 +1309,23 @@ def mla_decode_gluon(
     # (masked) MFMA, which is free when the GPU would otherwise be idle.
     if num_kv_splits is not None and REGIME != "bh64":
         NUM_KV_SPLITS = max(1, min(int(num_kv_splits), min_kv_seq_len))
+
+    # XCD remap: launch the bh16* M-pack path as a 1-D grid and swizzle so all
+    # SPLIT_QLEN qblocks of a (batch, split) land on the same XCD, letting the
+    # 2nd..Nth qblock's KV re-reads hit that XCD's L2. Only helps when (a) there
+    # are multiple qblocks to co-locate (split_qlen>1, i.e. an M-pack regime with
+    # qlen>QPOS_PER_BLOCK) and (b) the launch is multi-wave (grid_mn>256): with a
+    # single wave the swizzle only reshuffles XCD assignment and slightly unbalances
+    # it. Measured (MI350X, nhead16 bf16 ctx16384): batch256 qlen5/8 ~1.14-1.15x;
+    # batch<=128 neutral-to-small-regression -> gated to the multi-wave region.
+    _xcd_grid_mn = batch_size * NUM_KV_SPLITS * split_qlen
+    _xcd_eligible = REGIME in ("bh16mpack", "bh16mpack128") and split_qlen > 1
+    if _XCD_REMAP_MODE == "1":
+        USE_XCD_REMAP = _xcd_eligible
+    elif _XCD_REMAP_MODE == "0":
+        USE_XCD_REMAP = False
+    else:  # "auto": only the multi-wave region where L2 co-location pays off.
+        USE_XCD_REMAP = _xcd_eligible and _xcd_grid_mn > 256
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
@@ -1209,10 +1400,17 @@ def mla_decode_gluon(
             triton.cdiv(nhead, BLOCK_H) * qlen,
             (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
         )
+    elif USE_XCD_REMAP:
+        # 1-D grid + XCD swizzle: the kernel decodes program_id(0) into
+        # (cur_batch, split, qblock) via remap_xcd so a (batch, split)'s qblocks
+        # share an XCD. NUM_XCDS must be the real count (bh16* sets it to 1).
+        NUM_XCDS = get_num_xcds()
+        grid = (batch_size * NUM_KV_SPLITS * split_qlen,)
     else:
         # Grid axis 2: M-pack uses cdiv(qlen,4) qblocks (4 q_pos packed in M per
         # block); grid-axis path uses one program per q_pos (split_qlen==qlen).
         grid = (batch_size, NUM_KV_SPLITS, split_qlen)
+    grid_mn = batch_size * NUM_KV_SPLITS * split_qlen
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_decode_gluon[grid](
@@ -1251,6 +1449,7 @@ def mla_decode_gluon(
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
         NUM_KV_SPLITS=NUM_KV_SPLITS,
+        num_warps=(8 if REGIME == "bh16mpack128" else 4),
         PAGE_SIZE=PAGE_SIZE,
         HEAD_DIM_CKV=head_dim_ckv,
         HEAD_DIM_KPE=head_dim_kpe,
@@ -1262,6 +1461,9 @@ def mla_decode_gluon(
         REGIME=REGIME,
         RETURN_LSE=return_lse,
         IS_CAUSAL=IS_CAUSAL,
+        XCD_REMAP=USE_XCD_REMAP,
+        SPLIT_QLEN=split_qlen,
+        GRID_MN=grid_mn,
     )
 
     if NUM_KV_SPLITS == 1:
