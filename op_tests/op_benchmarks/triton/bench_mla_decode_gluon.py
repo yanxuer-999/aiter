@@ -6,7 +6,7 @@ import os
 import torch
 import triton
 import pandas as pd
-from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -51,7 +51,7 @@ def bench_mla_decode_gluon_fn(
     page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
     seq_lens = torch.full((batch_size,), ctx_lens, dtype=torch.int)
 
-    fn = lambda: mla_decode_gluon(  # noqa: E731
+    fn = lambda: mla_gluon(  # noqa: E731
         q_nope,
         q_pe,
         kv_c,
