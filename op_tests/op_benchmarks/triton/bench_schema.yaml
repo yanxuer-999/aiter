@@ -113,3 +113,18 @@ benchmarks:
   mla_decode_gluon:
     input_columns: [batch_size, ctx_lens, nhead]
     output_columns: [Time_(ms), TFLOPS, Bandwidth_(TB/s)]
+  gather_kv_b_proj:
+    input_columns: [B, block_size, tp_k_head_num, avg_kv_length]
+    output_columns: [TFLOPS, BW_GBs]
+  mla_gluon_decode:
+    input_columns: [B, H, ctx, regime]
+    output_columns: [TFLOPS, GB/s]
+  unified_attention_sparse_mla:
+    input_columns: [B, s_q, s_k, h_q, top_k]
+    output_columns: [TFLOPS, BW_GBs]
+  gemm_a16w16_model_shapes:
+    input_columns: [model, M, N, K]
+    output_columns: [TFLOPS, Time_ms]
+  gemm_a8w8_blockscale_preshuffle_model_shapes:
+    input_columns: [model, M, N, K]
+    output_columns: [TFLOPS, Time_ms]
