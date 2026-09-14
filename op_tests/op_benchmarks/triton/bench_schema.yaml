@@ -125,6 +125,35 @@ benchmarks:
   gemm_a16w16_model_shapes:
     input_columns: [model, M, N, K]
     output_columns: [TFLOPS, Time_ms]
+  flash_kda:
+    input_columns: [B, T, H, K, V]
+    output_columns: [Time_ms, TFLOPS, BW_GBs]
+  # bench_gmm.py names its CSV after the provider string, not bench_gmm.csv, so
+  # the daily renames it before ingestion; the metric column keeps the provider
+  # name. Both are stable for the bare run (bf16 in/out, int32 group sizes, no
+  # grid-dim or work-stealing override).
+  gmm:
+    input_columns: [M, K, N, G]
+    output_columns: [triton_gmm_ibf16_obf16_gint32_nnn_tflops]
+  # /data/triton-perf-ir-0824 reference cases -- see bench_perf_ir_cases.py.
+  perf_ir_attn_res_gate:
+    input_columns: [N, D, L]
+    output_columns: [packed_bandwidth]
+  perf_ir_mha_fwd_causal:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal]
+    output_columns: [TFLOPS]
+  perf_ir_mha_fwd_noncausal:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal]
+    output_columns: [TFLOPS]
+  perf_ir_rmsnorm_m32768_n16384:
+    input_columns: [model_name, M, N]
+    output_columns: [Bandwidth_(GB/s)]
+  perf_ir_fp8_mqa_logits_clean0:
+    input_columns: [batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim, clean_logits]
+    output_columns: [TFLOPs]
+  perf_ir_pa_decode_gluon_h64x8:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   gemm_a8w8_blockscale_preshuffle_model_shapes:
     input_columns: [model, M, N, K]
     output_columns: [TFLOPS, Time_ms]
