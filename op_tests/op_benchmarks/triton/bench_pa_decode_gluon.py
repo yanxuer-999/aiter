@@ -10,14 +10,48 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
+from contextlib import contextmanager
+
 from op_tests.triton_tests.test_pa_decode_gluon import run_pa_gluon_test
 import op_tests.triton_tests.test_pa_decode_gluon as _test_module
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
     prebuild_normal_performance_cases_aot_so,
     get_so_files_size_and_count,
 )
+from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
+    pa_decode_gluon_aot as _pa_decode_gluon_aot,
+)
 
 _test_module.USE_TORCH_FLASH_REF = False
+
+
+@contextmanager
+def _aot_backend():
+    """Swap test_pa_decode_gluon's JIT dispatcher for the AOT one, the same
+    monkeypatch op_tests/cpp/test_pa_decode_gluon_aot.py uses.
+
+    run_pa_gluon_test() has never taken a use_aot_impl kwarg -- passing one
+    straight through raised TypeError on every call, JIT or AOT, so this
+    bench script could not run at all until it was wired into
+    run_all_benchmarks.py surfaced the bug. AOT only supports
+    sliding_window=0 and ps=False; matches _run_aot's guard.
+    """
+
+    def _run_aot(*args, **kwargs):
+        sliding_window = kwargs.pop("sliding_window", 0)
+        ps = kwargs.pop("ps", False)
+        if sliding_window != 0 or ps:
+            raise ValueError(
+                "pa_decode_gluon_aot only supports sliding_window=0 and ps=False"
+            )
+        _pa_decode_gluon_aot(*args, **kwargs)
+
+    jit_backend = _test_module.pa_decode_gluon
+    _test_module.pa_decode_gluon = _run_aot
+    try:
+        yield
+    finally:
+        _test_module.pa_decode_gluon = jit_backend
 
 
 arg_to_compute_type = {
@@ -59,25 +93,29 @@ def bench_pa_decode_gluon_fn(
     sys.stdout = os.fdopen(1, "w", closefd=False)
     sys.stderr = os.fdopen(2, "w", closefd=False)
     try:
-        result = run_pa_gluon_test(
-            context_length=context_length,
-            batch_size=batch_size,
-            num_heads=num_heads,
-            head_size=head_size,
-            block_size=block_size,
-            compute_type=compute_type,
-            query_length=query_length,
-            quant_mode=quant_mode,
-            context_partition_size=256,
-            trans_v=False,
-            kv_varlen=kv_varlen,
-            use_aot_impl=use_aot_impl,
-            quant_q=quant_q,
-            quant_kv=quant_kv,
-            use_sinks=use_sinks,
-            sliding_window=sliding_window,
-            ps=ps,
-        )
+        run_kwargs = {
+            "context_length": context_length,
+            "batch_size": batch_size,
+            "num_heads": num_heads,
+            "head_size": head_size,
+            "block_size": block_size,
+            "compute_type": compute_type,
+            "query_length": query_length,
+            "quant_mode": quant_mode,
+            "context_partition_size": 256,
+            "trans_v": False,
+            "kv_varlen": kv_varlen,
+            "quant_q": quant_q,
+            "quant_kv": quant_kv,
+            "use_sinks": use_sinks,
+            "sliding_window": sliding_window,
+            "ps": ps,
+        }
+        if use_aot_impl:
+            with _aot_backend():
+                result = run_pa_gluon_test(**run_kwargs)
+        else:
+            result = run_pa_gluon_test(**run_kwargs)
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
