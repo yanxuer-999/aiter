@@ -12,10 +12,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 from op_tests.triton_tests.test_pa_decode_gluon import run_pa_gluon_test
 import op_tests.triton_tests.test_pa_decode_gluon as _test_module
-from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
-    prebuild_normal_performance_cases_aot_so,
-    get_so_files_size_and_count,
-)
 
 _test_module.USE_TORCH_FLASH_REF = False
 
@@ -44,7 +40,6 @@ def bench_pa_decode_gluon_fn(
     quant_mode,
     quant_q,
     quant_kv,
-    use_aot_impl,
     use_sinks,
     sliding_window,
     ps,
@@ -71,7 +66,6 @@ def bench_pa_decode_gluon_fn(
             context_partition_size=256,
             trans_v=False,
             kv_varlen=kv_varlen,
-            use_aot_impl=use_aot_impl,
             quant_q=quant_q,
             quant_kv=quant_kv,
             use_sinks=use_sinks,
@@ -116,7 +110,7 @@ COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [
 ]
 
 
-def run_normal_benchmark(args, use_aot_impl=False):
+def run_normal_benchmark(args):
     head_dim = args.head_dim if args.head_dim is not None else 128
     num_heads = tuple(args.num_heads) if args.num_heads is not None else (64, 4)
 
@@ -125,8 +119,7 @@ def run_normal_benchmark(args, use_aot_impl=False):
     else:
         x_vals = get_x_vals_normal()
 
-    mode_name = "normal_aot" if use_aot_impl else "normal"
-    plot_name = f"{get_caller_name_no_ext()}_{mode_name}"
+    plot_name = f"{get_caller_name_no_ext()}_normal"
 
     query_lengths = [args.query_length] if args.query_length else [1, 4]
 
@@ -166,7 +159,6 @@ def run_normal_benchmark(args, use_aot_impl=False):
                         quant_mode=args.quant_mode,
                         quant_q=_quant_q,
                         quant_kv=_quant_kv,
-                        use_aot_impl=use_aot_impl,
                         use_sinks=False,
                         sliding_window=0,
                         ps=False,
@@ -231,7 +223,6 @@ def run_sliding_window_benchmark(args):
                         quant_mode=args.quant_mode,
                         quant_q=_quant_q,
                         quant_kv=_quant_kv,
-                        use_aot_impl=False,
                         use_sinks=_use_sinks,
                         sliding_window=_sliding_window,
                         ps=True,
@@ -242,43 +233,13 @@ def run_sliding_window_benchmark(args):
                 bench.run(save_path="." if args.o else None, print_data=True)
 
 
-def _suppress_and_prebuild():
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_stdout_fd = os.dup(1)
-    saved_stderr_fd = os.dup(2)
-    os.dup2(devnull_fd, 1)
-    os.dup2(devnull_fd, 2)
-    saved_stdout = sys.stdout
-    saved_stderr = sys.stderr
-    sys.stdout = os.fdopen(1, "w", closefd=False)
-    sys.stderr = os.fdopen(2, "w", closefd=False)
-    try:
-        prebuild_normal_performance_cases_aot_so()
-        get_so_files_size_and_count()
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.dup2(saved_stdout_fd, 1)
-        os.dup2(saved_stderr_fd, 2)
-        os.close(saved_stdout_fd)
-        os.close(saved_stderr_fd)
-        os.close(devnull_fd)
-        sys.stdout = saved_stdout
-        sys.stderr = saved_stderr
-
-
 def run_benchmark(args):
     if args.mode == "normal":
-        run_normal_benchmark(args, use_aot_impl=False)
-    elif args.mode == "normal_aot":
-        _suppress_and_prebuild()
-        run_normal_benchmark(args, use_aot_impl=True)
+        run_normal_benchmark(args)
     elif args.mode == "sliding_window":
         run_sliding_window_benchmark(args)
     elif args.mode == "all":
-        run_normal_benchmark(args, use_aot_impl=False)
-        _suppress_and_prebuild()
-        run_normal_benchmark(args, use_aot_impl=True)
+        run_normal_benchmark(args)
         run_sliding_window_benchmark(args)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
@@ -293,8 +254,8 @@ def parse_args():
         "--mode",
         type=str,
         default="all",
-        choices=["normal", "normal_aot", "sliding_window", "all"],
-        help="Benchmark mode: normal, normal_aot, sliding_window, or all.",
+        choices=["normal", "sliding_window", "all"],
+        help="Benchmark mode: normal, sliding_window, or all.",
     )
     parser.add_argument(
         "--compute_type",

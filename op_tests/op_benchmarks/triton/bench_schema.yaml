@@ -104,6 +104,34 @@ benchmarks:
   pa_decode_gluon_normal_bf16_blk64_ql4:
     input_columns: [batch_size, context_length]
     output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  # The sliding_window sweep the bare `--mode all` run produces. These CSVs were
+  # never written before: the run died in the AOT prebuild ahead of them, which
+  # needed the composable_kernel submodule that nobody initializes. sw0 is the
+  # full-attention specialization of the same kernel, not a no-op variant.
+  pa_decode_gluon_sliding_window_fp8_sinksFalse_sw0:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_fp8_sinksFalse_sw128:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_fp8_sinksTrue_sw0:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_fp8_sinksTrue_sw128:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_bf16_sinksFalse_sw0:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_bf16_sinksFalse_sw128:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_bf16_sinksTrue_sw0:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_sliding_window_bf16_sinksTrue_sw128:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   fp8_mqa_logits:
     input_columns: [seq_q_l, seq_kv_l, num_heads_q, head_dim]
     output_columns: [TFLOPs]
