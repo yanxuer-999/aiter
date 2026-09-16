@@ -233,14 +233,74 @@ def run_sliding_window_benchmark(args):
                 bench.run(save_path="." if args.o else None, print_data=True)
 
 
+# Qwen3.5 decode at TP4, from issue #2000. The default sliding_window sweep runs
+# head_dim 64 / heads (64,8) / ctx 1024, so none of its points touch this kernel:
+# head_dim 256 with a single KV head is a different specialization, and it is the
+# one that went from 13.9 us to 45.1 us per call on Triton 3.8. sliding_window=0
+# selects the full-attention specialization, which is what the issue measures.
+ISSUE_2000 = dict(
+    batch_size=4,
+    context_length=4096,
+    num_heads=(8, 1),
+    head_size=256,
+    block_size=16,
+    query_length=1,
+    use_sinks=False,
+    sliding_window=0,
+)
+
+
+def run_head1_benchmark(args):
+    # Pinned, so unlike the other two this ignores the shape flags -- the point
+    # is to track one workload across builds, not to sweep.
+    plot_name = f"{get_caller_name_no_ext()}_sliding_window_head1"
+
+    benchmark = triton.testing.Benchmark(
+        x_names=["batch_size", "context_length"],
+        x_vals=[(ISSUE_2000["batch_size"], ISSUE_2000["context_length"])],
+        line_arg="metric",
+        line_vals=["time", "bandwidth"],
+        line_names=["Time_(ms)", "Bandwidth_(TB/s)"],
+        styles=[("red", "-"), ("blue", "-")],
+        ylabel="ms / TB/s",
+        plot_name=plot_name,
+        args={},
+    )
+
+    @triton.testing.perf_report([benchmark])
+    def bench(batch_size, context_length, metric, **kwargs):
+        return bench_pa_decode_gluon_fn(
+            batch_size=batch_size,
+            context_length=context_length,
+            num_heads=ISSUE_2000["num_heads"],
+            head_size=ISSUE_2000["head_size"],
+            block_size=ISSUE_2000["block_size"],
+            compute_type=aiter.dtypes.fp8,
+            query_length=ISSUE_2000["query_length"],
+            quant_mode=args.quant_mode,
+            quant_q=True,
+            quant_kv=True,
+            use_sinks=ISSUE_2000["use_sinks"],
+            sliding_window=ISSUE_2000["sliding_window"],
+            ps=True,
+            metric=metric,
+            kv_varlen=True,
+        )
+
+    bench.run(save_path="." if args.o else None, print_data=True)
+
+
 def run_benchmark(args):
     if args.mode == "normal":
         run_normal_benchmark(args)
     elif args.mode == "sliding_window":
         run_sliding_window_benchmark(args)
+    elif args.mode == "head1":
+        run_head1_benchmark(args)
     elif args.mode == "all":
         run_normal_benchmark(args)
         run_sliding_window_benchmark(args)
+        run_head1_benchmark(args)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -254,8 +314,9 @@ def parse_args():
         "--mode",
         type=str,
         default="all",
-        choices=["normal", "sliding_window", "all"],
-        help="Benchmark mode: normal, sliding_window, or all.",
+        choices=["normal", "sliding_window", "head1", "all"],
+        help="Benchmark mode: normal, sliding_window, head1 (the pinned issue "
+        "#2000 workload), or all.",
     )
     parser.add_argument(
         "--compute_type",
