@@ -104,9 +104,21 @@ benchmarks:
   pa_decode_gluon_normal_bf16_blk64_ql4:
     input_columns: [batch_size, context_length]
     output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  # The bench writes eight normal CSVs but only five ever had a key, so these
+  # three bf16 variants were produced and then dropped at ingest every run.
+  pa_decode_gluon_normal_bf16_blk16_ql1:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_normal_bf16_blk16_ql4:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  pa_decode_gluon_normal_bf16_blk64_ql1:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   # The sliding_window sweep the bare `--mode all` run produces. These CSVs were
-  # never written before: the run died in the AOT prebuild ahead of them, which
-  # needed the composable_kernel submodule that nobody initializes. sw0 is the
+  # never written before: on the rebased tree the bench aborted on the first case
+  # with `TypeError: run_pa_gluon_test() got an unexpected keyword argument
+  # 'use_aot_impl'`, so nothing downstream of it ever ran. sw0 is the
   # full-attention specialization of the same kernel, not a no-op variant.
   pa_decode_gluon_sliding_window_fp8_sinksFalse_sw0:
     input_columns: [batch_size, context_length]
