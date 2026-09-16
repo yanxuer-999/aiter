@@ -120,6 +120,12 @@ benchmarks:
   # with `TypeError: run_pa_gluon_test() got an unexpected keyword argument
   # 'use_aot_impl'`, so nothing downstream of it ever ran. sw0 is the
   # full-attention specialization of the same kernel, not a no-op variant.
+  # The pinned Qwen3.5-at-TP4 workload from issue #2000. Kept separate from the
+  # sweep below because it is a fixed point tracked across builds, not a shape
+  # scan: head_dim 256 with one KV head, which the sweep never reaches.
+  pa_decode_gluon_sliding_window_head1:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   pa_decode_gluon_sliding_window_fp8_sinksFalse_sw0:
     input_columns: [batch_size, context_length]
     output_columns: [Time_(ms), Bandwidth_(TB/s)]
