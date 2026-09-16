@@ -16,6 +16,9 @@ shapes where the tuner picked a Triton kernel, i.e. where a Triton compiler regr
 actually reaches production. Everything else in those files is a real model shape served by
 some other backend, and is out of scope here.
 
+One shape is not from those CSVs and is marked where it appears: a workload we are
+tracking at a batch size the tuner never recorded.
+
 Deliberately NOT included
 -------------------------
 - MoE (glm5_fp4/mxfp8/ptpc, dsv4_fp8fp4, kimik3_a4w4/a8w4/a16w4, qwen3_5 fp4): every
@@ -54,6 +57,11 @@ BF16_SHAPES = {
     "glm5.3": [
         (1, 1024, 128), (1, 4096, 1024), (1, 4096, 1536),
         (2, 288, 4096), (2, 1024, 128), (2, 4096, 1024), (2, 4096, 1536),
+        # (4, 32, 4096) is the one row here that is not a tuned-CSV entry: it is
+        # GDN in_proj_ba at decode batch 4, the kernel tracked by the Triton 3.8
+        # regression report (45 calls per decode step, +19.4 us per call). The CSV
+        # tunes this N/K only at M=16, which never sees that cost.
+        (4, 32, 4096),
         (4, 288, 4096), (4, 1024, 128), (4, 4096, 1024), (4, 4096, 1536),
         (8, 1024, 128), (8, 4096, 1024),
         (16, 8, 4096), (16, 32, 4096), (16, 288, 4096), (16, 1024, 128),
