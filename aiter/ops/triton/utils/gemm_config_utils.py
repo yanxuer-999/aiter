@@ -175,7 +175,22 @@ def get_gemm_config(
     config, is_tuned = _get_gemm_config_cached(
         config_name, M, N, K, bounds, specialized_filename, backend, B
     )
-    return _copy_gemm_config(config), is_tuned
+    config = _copy_gemm_config(config)
+    # Triton rejects launch options it doesn't know, and llvm_fn_attrs only
+    # exists since Triton 3.8: drop it there and keep the rest of the config.
+    if "llvm_fn_attrs" in config and "llvm_fn_attrs" not in _hip_option_names():
+        config.pop("llvm_fn_attrs")
+    return config, is_tuned
+
+
+@functools.lru_cache(maxsize=None)
+def _hip_option_names() -> frozenset:
+    """Compile options the installed Triton's AMD backend accepts."""
+    try:
+        from triton.backends.amd.compiler import HIPOptions
+    except ImportError:
+        return frozenset()
+    return frozenset(HIPOptions.__dataclass_fields__)
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
