@@ -13,6 +13,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle_pipelined as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
+    get_scaled_upcast_fp4_scale_layout as _gfx950_get_scale_layout,
+)
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
@@ -448,7 +451,19 @@ def moe_gemm_a16w4(
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
             # and K % 256 == 0. Otherwise, fallback to Triton
             mask_k_limit = K % 256
-            if mask_k_limit != 0 or swizzle_mx_scale is None:
+            # The gluon kernel addresses x (gathered rows) and one expert's
+            # w / w_scales with int32 buffer offsets, so each must fit in int32.
+            buffer_offsets_overflow = (
+                can_overflow_int32(x)
+                or can_overflow_int32(w[0])
+                or can_overflow_int32(w_scales[0])
+            )
+            if (
+                mask_k_limit != 0
+                or swizzle_mx_scale is None
+                or buffer_offsets_overflow
+                or _gfx950_get_scale_layout is None
+            ):
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:

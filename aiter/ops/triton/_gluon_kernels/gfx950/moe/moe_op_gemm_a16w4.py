@@ -9,6 +9,13 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
 )
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
+# Triton 3.8 exposes this as gl.amd.get_scaled_upcast_fp4_scale_layout; newer
+# Triton moved it into the arch namespaces (gl.amd.cdna3 / gl.amd.cdna4). Older
+# Triton (3.7) has neither, and the wrapper then falls back to the Triton kernel.
+get_scaled_upcast_fp4_scale_layout = getattr(
+    gl.amd.cdna4, "get_scaled_upcast_fp4_scale_layout", None
+) or getattr(gl.amd, "get_scaled_upcast_fp4_scale_layout", None)
+
 
 def matmul_launch_metadata(grid, kernel, args):
     ret = {}
@@ -188,9 +195,11 @@ def _moe_gemm_a16w4_swizzle(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    # 64-bit (UPCAST_INDICES) arithmetic is only needed for the scalar
+    # per-expert / per-row base pointers below. The buffer ops take int32
+    # offsets relative to those bases, and the tile-local offsets always fit.
+    expt_id = expt_id.to(index_type)
     start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
 
     W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
     W_N_DIVISOR: gl.constexpr = 1
@@ -269,8 +278,8 @@ def _moe_gemm_a16w4_swizzle(
         offs_x_m_l = gl.convert_layout(offs_x_m, gl.SliceLayout(1, LOAD_LAYOUT_X))
     offs_x_k_l = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_LAYOUT_X))
     x_offsets = (
-        offs_x_m_l.to(index_type)[:, None] * stride_x_m
-        + offs_x_k_l.to(index_type)[None, :] * stride_x_k
+        offs_x_m_l.to(gl.int32)[:, None] * stride_x_m
+        + offs_x_k_l.to(gl.int32)[None, :] * stride_x_k
     )
 
     # W pointers
@@ -285,8 +294,8 @@ def _moe_gemm_a16w4_swizzle(
     )
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(1, LOAD_LAYOUT_W))
     w_offsets = (
-        offs_w_k.to(index_type)[:, None] * stride_w_k
-        + offs_w_n[None, :].to(index_type) * stride_w_n
+        offs_w_k.to(gl.int32)[:, None] * stride_w_k
+        + offs_w_n[None, :].to(gl.int32) * stride_w_n
     )
 
     # W scale pointers
@@ -306,8 +315,8 @@ def _moe_gemm_a16w4_swizzle(
     )
     offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
     w_scale_offsets = (
-        offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
-        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+        offs_w_k_scale.to(gl.int32)[None, :] * stride_w_mx_k
+        + offs_w_n_scale.to(gl.int32)[:, None] * stride_w_mx_n
     )
     # TTGIR shared layouts: #shared2 (X), #shared (W, K-major), #shared1 (scale).
     SHARED_LAYOUT_X: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
@@ -362,7 +371,7 @@ def _moe_gemm_a16w4_swizzle(
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+        w_scale_layout: gl.constexpr = get_scaled_upcast_fp4_scale_layout(
             w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
         )
 
@@ -539,9 +548,11 @@ def _moe_gemm_a16w4_swizzle_pipelined(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    # 64-bit (UPCAST_INDICES) arithmetic is only needed for the scalar
+    # per-expert / per-row base pointers below. The buffer ops take int32
+    # offsets relative to those bases, and the tile-local offsets always fit.
+    expt_id = expt_id.to(index_type)
     start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
 
     W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
     W_N_DIVISOR: gl.constexpr = 1
@@ -630,8 +641,8 @@ def _moe_gemm_a16w4_swizzle_pipelined(
         offs_x_m_l = gl.convert_layout(offs_x_m, gl.SliceLayout(1, LOAD_LAYOUT_X))
     offs_x_k_l = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_LAYOUT_X))
     x_offsets = (
-        offs_x_m_l.to(index_type)[:, None] * stride_x_m
-        + offs_x_k_l.to(index_type)[None, :] * stride_x_k
+        offs_x_m_l.to(gl.int32)[:, None] * stride_x_m
+        + offs_x_k_l.to(gl.int32)[None, :] * stride_x_k
     )
 
     # W pointers
@@ -649,8 +660,8 @@ def _moe_gemm_a16w4_swizzle_pipelined(
     )
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(1, LOAD_LAYOUT_W))
     w_offsets = (
-        offs_w_k.to(index_type)[:, None] * stride_w_k
-        + offs_w_n.to(index_type)[None, :] * stride_w_n
+        offs_w_k.to(gl.int32)[:, None] * stride_w_k
+        + offs_w_n.to(gl.int32)[None, :] * stride_w_n
     )
 
     # W scale pointers
@@ -670,8 +681,8 @@ def _moe_gemm_a16w4_swizzle_pipelined(
     )
     offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
     w_scale_offsets = (
-        offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
-        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+        offs_w_k_scale.to(gl.int32)[None, :] * stride_w_mx_k
+        + offs_w_n_scale.to(gl.int32)[:, None] * stride_w_mx_n
     )
 
     # v2: stage X/W/scale global -> LDS directly via async buffer_load_to_shared
@@ -753,7 +764,7 @@ def _moe_gemm_a16w4_swizzle_pipelined(
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+        w_scale_layout: gl.constexpr = get_scaled_upcast_fp4_scale_layout(
             w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
         )
         w_scales = gl.convert_layout(w_scales, w_scale_layout)
@@ -773,7 +784,7 @@ def _moe_gemm_a16w4_swizzle_pipelined(
     w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
     w_scales = w_scales.trans(1, 0)
-    w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+    w_scale_layout: gl.constexpr = get_scaled_upcast_fp4_scale_layout(
         w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
     )
     w_scales = gl.convert_layout(w_scales, w_scale_layout)
