@@ -37,6 +37,7 @@ duplicated here.
 """
 
 import argparse
+import inspect
 import sys
 
 import triton
@@ -50,6 +51,25 @@ from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
     triton_gemm_a8w8_blockscale_preshuffle,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+
+try:  # ROCm/aiter#6551 and later
+    from op_tests.op_benchmarks.triton.utils.argparse import (
+        get_do_bench_graph_kwargs,
+        get_parser,
+        get_rot_bufs_kwargs,
+    )
+except ImportError:
+    get_parser = None
+
+
+def _lead_args(fn):
+    """ROCm/aiter#6551 put (kwargs_rot_bufs, kwargs_do_bench_graph) in front of the
+    upstream bench_gemm_fn arguments. Pass them, at the upstream CLI defaults, when
+    the helper takes them; the nightly rebases this tree onto main, so both forms occur."""
+    if get_parser is None or "kwargs_rot_bufs" not in inspect.signature(fn).parameters:
+        return ()
+    d = get_parser(get_caller_name_no_ext()).parse_args([])
+    return (get_rot_bufs_kwargs(d), get_do_bench_graph_kwargs(d))
 
 # (M, N, K) per model, from *_bf16_tuned_gemm.csv where gfx=gfx950 and libtype=triton.
 # Production dispatch: aiter/tuned_gemm.py solMap["triton"] -> triton_gemm -> gemm_a16w16.
@@ -156,9 +176,11 @@ def run_bf16(args, metrics):
         return
     # Pin backend="triton": production picked the Triton kernel for these rows, and the
     # auto path would silently choose Gluon on gfx1250, which is a different kernel.
+    lead = _lead_args(bench_a16w16_fn)
+
     @triton.testing.perf_report([_benchmark("bench_gemm_a16w16_model_shapes", x_vals, metrics)])
     def bench(model, M, N, K, metric, **kwargs):
-        return bench_a16w16_fn(M, N, K, metric, args.layout, "triton")
+        return bench_a16w16_fn(*lead, M, N, K, metric, args.layout, "triton")
 
     bench.run(save_path="." if args.o else None, print_data=True)
 
@@ -173,11 +195,14 @@ def run_a8w8_blockscale_preshuffle(args, metrics):
         )
         return
 
+    lead = _lead_args(bench_a8w8_blockscale_fn)
+
     @triton.testing.perf_report(
         [_benchmark("bench_gemm_a8w8_blockscale_preshuffle_model_shapes", x_vals, metrics)]
     )
     def bench(model, M, N, K, metric, **kwargs):
         return bench_a8w8_blockscale_fn(
+            *lead,
             M,
             N,
             K,
