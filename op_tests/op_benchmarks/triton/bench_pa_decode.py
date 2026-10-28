@@ -334,7 +334,8 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
-    override_parser_action(parser, "backend", default="triton")
+    # Actions are keyed by option string: "backend" raised KeyError before any bench ran.
+    override_parser_action(parser, "--backend", default="triton")
 
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
