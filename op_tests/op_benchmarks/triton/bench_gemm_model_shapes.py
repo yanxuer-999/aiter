@@ -63,13 +63,25 @@ except ImportError:
 
 
 def _lead_args(fn):
-    """ROCm/aiter#6551 put (kwargs_rot_bufs, kwargs_do_bench_graph) in front of the
-    upstream bench_gemm_fn arguments. Pass them, at the upstream CLI defaults, when
-    the helper takes them; the nightly rebases this tree onto main, so both forms occur."""
-    if get_parser is None or "kwargs_rot_bufs" not in inspect.signature(fn).parameters:
+    """Arguments the upstream bench_gemm_fn takes in front of (M, N, K, ...), at the
+    upstream CLI defaults. The nightly rebases this tree onto ROCm/aiter main, and that
+    prefix has changed twice:
+      - before #6551:  none;
+      - #6551:         (kwargs_rot_bufs, kwargs_do_bench_graph);
+      - #7121 (11-03): (bencher,), a RotatingBufferBench built from both dicts.
+    An unknown prefix fails here, by name, rather than as a TypeError about a
+    shifted argument inside the bench."""
+    first = next(iter(inspect.signature(fn).parameters))
+    if first == "M":
         return ()
-    d = get_parser(get_caller_name_no_ext()).parse_args([])
-    return (get_rot_bufs_kwargs(d), get_do_bench_graph_kwargs(d))
+    d = get_parser(get_caller_name_no_ext()).parse_args([]) if get_parser else None
+    if first == "kwargs_rot_bufs" and d is not None:
+        return (get_rot_bufs_kwargs(d), get_do_bench_graph_kwargs(d))
+    if first == "bencher" and d is not None:
+        from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import RotatingBufferBench
+        return (RotatingBufferBench.from_dict({**get_rot_bufs_kwargs(d), **get_do_bench_graph_kwargs(d)}),)
+    raise TypeError(f"bench_gemm_model_shapes: unknown leading argument '{first}' of {fn.__module__}."
+                    f"{fn.__name__}; adapt _lead_args to the upstream API")
 
 # (M, N, K) per model, from *_bf16_tuned_gemm.csv where gfx=gfx950 and libtype=triton.
 # Production dispatch: aiter/tuned_gemm.py solMap["triton"] -> triton_gemm -> gemm_a16w16.
