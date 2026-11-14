@@ -64,8 +64,9 @@ def benchmark(args):
 
     configs = []
 
-    if args.model:
-        x_names, x_vals_list = model_benchmark_configs(args)
+    if not args.model:
+        args.model = "deepseek"
+    x_names, x_vals_list = model_benchmark_configs(args)
 
     line_vals = ["mla_decode_fwd"]
 
@@ -153,7 +154,7 @@ def benchmark(args):
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = get_parser(kernel_name="MLA Prefill")
     parser.add_argument("-b", type=int, default=0, help="Batch size")
-    parser.add_argument("--seqlen", type=int, default=0, help="Sequence length")
+    parser.add_argument("--seqlen", type=int, default=8192, help="Sequence length")
     parser.add_argument(
         "-equal_seqlens",
         action="store_true",
